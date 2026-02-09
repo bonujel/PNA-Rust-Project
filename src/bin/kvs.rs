@@ -1,4 +1,6 @@
 use clap::{Parser, Subcommand};
+use kvs::{KvError, KvStore, Result};
+use std::env::current_dir;
 use std::process;
 
 /// A simple key-value store CLI
@@ -33,25 +35,36 @@ enum Commands {
     },
 }
 
-fn main() {
+fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Commands::Set { key: _, value: _ }) => {
-            eprintln!("unimplemented");
-            process::exit(1);
+        Some(Commands::Set { key, value }) => {
+            let mut store = KvStore::open(current_dir()?)?;
+            store.set(key, value)?;
         }
-        Some(Commands::Get { key: _ }) => {
-            eprintln!("unimplemented");
-            process::exit(1);
+        Some(Commands::Get { key }) => {
+            let mut store = KvStore::open(current_dir()?)?;
+            match store.get(key)? {
+                Some(value) => print!("{value}"),
+                None => print!("Key not found"),
+            }
         }
-        Some(Commands::Remove { key: _ }) => {
-            eprintln!("unimplemented");
-            process::exit(1);
+        Some(Commands::Remove { key }) => {
+            let mut store = KvStore::open(current_dir()?)?;
+            match store.remove(key) {
+                Ok(()) => {}
+                Err(KvError::KeyNotFound) => {
+                    print!("Key not found");
+                    process::exit(1);
+                }
+                Err(e) => return Err(e),
+            }
         }
         None => {
-            eprintln!("unimplemented");
             process::exit(1);
         }
     }
+
+    Ok(())
 }
