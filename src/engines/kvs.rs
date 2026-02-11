@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Deserializer;
 
+use super::KvsEngine;
 use crate::{KvError, Result};
 
 /// Compaction threshold in bytes.
@@ -54,11 +55,6 @@ impl KvStore {
     ///
     /// Creates the directory if it does not exist.
     /// Replays existing log files to rebuild the in-memory index.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the directory cannot be created, or if existing
-    /// log files cannot be read or deserialized.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
         fs::create_dir_all(&path)?;
@@ -87,14 +83,51 @@ impl KvStore {
         })
     }
 
-    /// Sets the value of a string key to a string.
-    ///
-    /// If the key already exists, the previous value will be overwritten.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the value cannot be serialized or written to disk.
-    pub fn set(&mut self, key: String, value: String) -> Result<()> {
+    /// Compacts the log by writing only the latest values to a new log file.
+    fn compact(&mut self) -> Result<()> {
+        let compaction_gen = self.current_gen + 1;
+        self.current_gen += 2;
+        self.writer = new_log_file(&self.path, self.current_gen, &mut self.readers)?;
+
+        let mut compaction_writer = new_log_file(&self.path, compaction_gen, &mut self.readers)?;
+
+        let mut new_pos = 0u64;
+        for cmd_pos in self.index.values_mut() {
+            let reader = self
+                .readers
+                .get_mut(&cmd_pos.gen)
+                .ok_or(KvError::LogFileNotFound(cmd_pos.gen))?;
+            reader.seek(SeekFrom::Start(cmd_pos.pos))?;
+
+            let mut entry_reader = reader.take(cmd_pos.len);
+            let len = io::copy(&mut entry_reader, &mut compaction_writer)?;
+            *cmd_pos = CommandPos {
+                gen: compaction_gen,
+                pos: new_pos,
+                len,
+            };
+            new_pos += len;
+        }
+        compaction_writer.flush()?;
+
+        let stale_gens: Vec<u64> = self
+            .readers
+            .keys()
+            .filter(|&&gen| gen < compaction_gen)
+            .copied()
+            .collect();
+        for stale_gen in stale_gens {
+            self.readers.remove(&stale_gen);
+            fs::remove_file(log_path(&self.path, stale_gen))?;
+        }
+        self.uncompacted = 0;
+
+        Ok(())
+    }
+}
+
+impl KvsEngine for KvStore {
+    fn set(&mut self, key: String, value: String) -> Result<()> {
         let cmd = Command::Set {
             key: key.clone(),
             value,
@@ -122,16 +155,8 @@ impl KvStore {
         Ok(())
     }
 
-    /// Gets the string value of a given string key.
-    ///
-    /// Returns `None` if the key does not exist.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the log file for the key's generation is missing,
-    /// or if the stored command cannot be deserialized.
     #[allow(clippy::needless_pass_by_value)]
-    pub fn get(&mut self, key: String) -> Result<Option<String>> {
+    fn get(&mut self, key: String) -> Result<Option<String>> {
         if let Some(cmd_pos) = self.index.get(&key) {
             let reader = self
                 .readers
@@ -149,14 +174,8 @@ impl KvStore {
         }
     }
 
-    /// Removes a given key.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`KvError::KeyNotFound`] if the key does not exist,
-    /// or an IO/serialization error if the removal cannot be persisted.
     #[allow(clippy::needless_pass_by_value)]
-    pub fn remove(&mut self, key: String) -> Result<()> {
+    fn remove(&mut self, key: String) -> Result<()> {
         if !self.index.contains_key(&key) {
             return Err(KvError::KeyNotFound);
         }
@@ -168,52 +187,6 @@ impl KvStore {
         if let Some(old_cmd) = self.index.remove(&key) {
             self.uncompacted += old_cmd.len;
         }
-
-        Ok(())
-    }
-
-    /// Compacts the log by writing only the latest values to a new log file.
-    ///
-    /// Stale entries are discarded, and old log files are removed.
-    fn compact(&mut self) -> Result<()> {
-        // Use current_gen + 1 for compaction, current_gen + 2 for new writes
-        let compaction_gen = self.current_gen + 1;
-        self.current_gen += 2;
-        self.writer = new_log_file(&self.path, self.current_gen, &mut self.readers)?;
-
-        let mut compaction_writer = new_log_file(&self.path, compaction_gen, &mut self.readers)?;
-
-        let mut new_pos = 0u64;
-        for cmd_pos in self.index.values_mut() {
-            let reader = self
-                .readers
-                .get_mut(&cmd_pos.gen)
-                .ok_or(KvError::LogFileNotFound(cmd_pos.gen))?;
-            reader.seek(SeekFrom::Start(cmd_pos.pos))?;
-
-            let mut entry_reader = reader.take(cmd_pos.len);
-            let len = io::copy(&mut entry_reader, &mut compaction_writer)?;
-            *cmd_pos = CommandPos {
-                gen: compaction_gen,
-                pos: new_pos,
-                len,
-            };
-            new_pos += len;
-        }
-        compaction_writer.flush()?;
-
-        // Remove stale log files (all generations before compaction_gen)
-        let stale_gens: Vec<u64> = self
-            .readers
-            .keys()
-            .filter(|&&gen| gen < compaction_gen)
-            .copied()
-            .collect();
-        for stale_gen in stale_gens {
-            self.readers.remove(&stale_gen);
-            fs::remove_file(log_path(&self.path, stale_gen))?;
-        }
-        self.uncompacted = 0;
 
         Ok(())
     }
@@ -237,8 +210,6 @@ fn sorted_gen_list(path: &Path) -> Result<Vec<u64>> {
 }
 
 /// Loads a single log file and populates the index.
-///
-/// Returns the number of bytes of stale (overwritten/removed) commands.
 fn load(
     gen: u64,
     reader: &mut BufReaderWithPos<File>,
@@ -267,7 +238,6 @@ fn load(
                 if let Some(old_cmd) = index.remove(&key) {
                     uncompacted += old_cmd.len;
                 }
-                // The remove command itself is also stale
                 uncompacted += new_pos - pos;
             }
         }
