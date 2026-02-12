@@ -4,6 +4,10 @@ use super::KvsEngine;
 use crate::{KvError, Result};
 
 /// A key-value store backed by the `sled` embedded database.
+///
+/// `sled::Db` is internally `Arc`-based, so cloning is cheap
+/// and thread-safe by design.
+#[derive(Clone)]
 pub struct SledKvsEngine {
     db: Db,
 }
@@ -16,13 +20,13 @@ impl SledKvsEngine {
 }
 
 impl KvsEngine for SledKvsEngine {
-    fn set(&mut self, key: String, value: String) -> Result<()> {
+    fn set(&self, key: String, value: String) -> Result<()> {
         self.db.insert(key.as_bytes(), value.as_bytes())?;
         self.db.flush()?;
         Ok(())
     }
 
-    fn get(&mut self, key: String) -> Result<Option<String>> {
+    fn get(&self, key: String) -> Result<Option<String>> {
         Ok(self
             .db
             .get(key.as_bytes())?
@@ -30,7 +34,7 @@ impl KvsEngine for SledKvsEngine {
             .transpose()?)
     }
 
-    fn remove(&mut self, key: String) -> Result<()> {
+    fn remove(&self, key: String) -> Result<()> {
         self.db
             .remove(key.as_bytes())?
             .ok_or(KvError::KeyNotFound)?;

@@ -6,7 +6,10 @@ use std::process::exit;
 use clap::Parser;
 use log::{error, info};
 
-use kvs::{KvStore, KvsEngine, KvsServer, Result, SledKvsEngine};
+use kvs::{
+    KvError, KvStore, KvsEngine, KvsServer, Result, SharedQueueThreadPool, SledKvsEngine,
+    ThreadPool,
+};
 
 const DEFAULT_ADDR: &str = "127.0.0.1:4000";
 const DEFAULT_ENGINE: &str = "kvs";
@@ -39,23 +42,33 @@ fn main() {
 
 fn run(cli: Cli) -> Result<()> {
     let engine_name = resolve_engine(cli.engine)?;
+    let num_cpus = num_cpus::get() as u32;
 
     info!("kvs-server {}", env!("CARGO_PKG_VERSION"));
     info!("Storage engine: {}", engine_name);
     info!("Listening on {}", cli.addr);
 
     match engine_name.as_str() {
-        "kvs" => run_with_engine(KvStore::open(current_dir()?)?, cli.addr),
+        "kvs" => run_with_engine(
+            KvStore::open(current_dir()?)?,
+            SharedQueueThreadPool::new(num_cpus)?,
+            cli.addr,
+        ),
         "sled" => run_with_engine(
             SledKvsEngine::new(sled::open(current_dir()?)?),
+            SharedQueueThreadPool::new(num_cpus)?,
             cli.addr,
         ),
         _ => unreachable!(),
     }
 }
 
-fn run_with_engine<E: KvsEngine>(engine: E, addr: SocketAddr) -> Result<()> {
-    let mut server = KvsServer::new(engine);
+fn run_with_engine<E: KvsEngine, P: ThreadPool>(
+    engine: E,
+    pool: P,
+    addr: SocketAddr,
+) -> Result<()> {
+    let server = KvsServer::new(engine, pool);
     server.run(addr)
 }
 
@@ -65,32 +78,27 @@ fn resolve_engine(engine: Option<String>) -> Result<String> {
     let prev_engine = fs::read_to_string(&engine_file).ok();
 
     let engine = match (engine, prev_engine) {
-        // User specified, no previous: use user's choice
         (Some(e), None) => e,
-        // User specified, has previous: must match
         (Some(e), Some(prev)) => {
             if e != prev {
-                error!(
+                return Err(KvError::StringError(format!(
                     "Wrong engine! Previously used '{}', but '{}' was requested.",
                     prev, e
-                );
-                std::process::exit(1);
+                )));
             }
             e
         }
-        // No user choice, has previous: use previous
         (None, Some(prev)) => prev,
-        // No user choice, no previous: use default
         (None, None) => DEFAULT_ENGINE.to_owned(),
     };
 
-    // Validate engine name
     if engine != "kvs" && engine != "sled" {
-        error!("Invalid engine: {}. Must be 'kvs' or 'sled'.", engine);
-        std::process::exit(1);
+        return Err(KvError::StringError(format!(
+            "Invalid engine: {}. Must be 'kvs' or 'sled'.",
+            engine
+        )));
     }
 
-    // Persist engine choice
     fs::write(current_dir()?.join("engine"), &engine)?;
 
     Ok(engine)

@@ -1,8 +1,11 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Deserializer;
@@ -31,23 +34,97 @@ struct CommandPos {
     len: u64,
 }
 
-/// A log-structured key-value store.
+/// A log-structured key-value store with lock-free readers.
 ///
-/// Data is persisted to disk using append-only log files.
-/// An in-memory index maps keys to their positions in the log.
+/// Write operations are serialized via a `Mutex`. The in-memory index
+/// uses `RwLock` for concurrent read access. Each clone maintains its
+/// own set of file readers to avoid lock contention on reads.
 pub struct KvStore {
-    /// Directory where log files are stored.
-    path: PathBuf,
+    /// Directory where log files are stored (immutable).
+    path: Arc<PathBuf>,
+    /// Shared in-memory index: key -> log pointer. RwLock allows
+    /// multiple concurrent readers with a single writer.
+    index: Arc<RwLock<HashMap<String, CommandPos>>>,
+    /// Writer-side state, protected by Mutex (single writer).
+    writer: Arc<Mutex<KvStoreWriter>>,
+    /// Per-clone reader handles (not shared between threads).
+    reader: KvStoreReader,
+}
+
+impl Clone for KvStore {
+    fn clone(&self) -> Self {
+        KvStore {
+            path: self.path.clone(),
+            index: self.index.clone(),
+            writer: self.writer.clone(),
+            // Each clone gets a fresh set of readers — this is the key
+            // to lock-free reads: no shared mutable reader state.
+            reader: KvStoreReader {
+                safe_point: self.reader.safe_point.clone(),
+                path: self.path.clone(),
+                readers: RefCell::new(HashMap::new()),
+            },
+        }
+    }
+}
+
+/// Writer-side state, protected by a Mutex.
+struct KvStoreWriter {
     /// Current generation number for the active log file.
     current_gen: u64,
     /// Writer for the current active log file.
     writer: BufWriterWithPos<File>,
-    /// Readers for each log file generation.
+    /// Writer's own readers (used during compaction only).
     readers: HashMap<u64, BufReaderWithPos<File>>,
-    /// In-memory index: key -> log pointer.
-    index: HashMap<String, CommandPos>,
     /// Number of bytes of stale (compactable) data.
     uncompacted: u64,
+}
+
+/// Per-clone reader state. Each thread gets its own instance via Clone.
+struct KvStoreReader {
+    /// Minimum valid generation after compaction.
+    safe_point: Arc<AtomicU64>,
+    /// Path to log directory (for lazy file opening).
+    path: Arc<PathBuf>,
+    /// Per-thread reader handles, lazily opened.
+    readers: RefCell<HashMap<u64, BufReaderWithPos<File>>>,
+}
+
+impl KvStoreReader {
+    /// Reads a command from the log using per-thread file handles.
+    ///
+    /// Lazily opens file handles as needed. Cleans up stale handles
+    /// when the safe_point advances (after compaction).
+    fn read_command(&self, cmd_pos: CommandPos) -> Result<Option<String>> {
+        self.close_stale_readers();
+
+        let mut readers = self.readers.borrow_mut();
+        let reader = match readers.entry(cmd_pos.gen) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let r = BufReaderWithPos::new(
+                    File::open(log_path(&self.path, cmd_pos.gen))?,
+                )?;
+                e.insert(r)
+            }
+        };
+        reader.seek(SeekFrom::Start(cmd_pos.pos))?;
+        let cmd_reader = reader.take(cmd_pos.len);
+        if let Command::Set { value, .. } = serde_json::from_reader(cmd_reader)? {
+            Ok(Some(value))
+        } else {
+            Err(KvError::UnexpectedCommandType)
+        }
+    }
+
+    /// Removes file handles for generations older than the safe point.
+    fn close_stale_readers(&self) {
+        let safe_point = self.safe_point.load(Ordering::Acquire);
+        if safe_point > 0 {
+            let mut readers = self.readers.borrow_mut();
+            readers.retain(|&gen, _| gen >= safe_point);
+        }
+    }
 }
 
 impl KvStore {
@@ -65,7 +142,9 @@ impl KvStore {
 
         let gen_list = sorted_gen_list(&path)?;
         for &gen in &gen_list {
-            let mut reader = BufReaderWithPos::new(File::open(log_path(&path, gen))?)?;
+            let mut reader = BufReaderWithPos::new(
+                File::open(log_path(&path, gen))?,
+            )?;
             uncompacted += load(gen, &mut reader, &mut index)?;
             readers.insert(gen, reader);
         }
@@ -73,119 +152,163 @@ impl KvStore {
         let current_gen = gen_list.last().unwrap_or(&0) + 1;
         let writer = new_log_file(&path, current_gen, &mut readers)?;
 
-        Ok(Self {
-            path,
+        let safe_point = Arc::new(AtomicU64::new(0));
+        let path = Arc::new(path);
+
+        let kv_writer = KvStoreWriter {
             current_gen,
             writer,
             readers,
-            index,
             uncompacted,
+        };
+
+        let reader = KvStoreReader {
+            safe_point: safe_point.clone(),
+            path: path.clone(),
+            readers: RefCell::new(HashMap::new()),
+        };
+
+        Ok(Self {
+            path,
+            index: Arc::new(RwLock::new(index)),
+            writer: Arc::new(Mutex::new(kv_writer)),
+            reader,
         })
-    }
-
-    /// Compacts the log by writing only the latest values to a new log file.
-    fn compact(&mut self) -> Result<()> {
-        let compaction_gen = self.current_gen + 1;
-        self.current_gen += 2;
-        self.writer = new_log_file(&self.path, self.current_gen, &mut self.readers)?;
-
-        let mut compaction_writer = new_log_file(&self.path, compaction_gen, &mut self.readers)?;
-
-        let mut new_pos = 0u64;
-        for cmd_pos in self.index.values_mut() {
-            let reader = self
-                .readers
-                .get_mut(&cmd_pos.gen)
-                .ok_or(KvError::LogFileNotFound(cmd_pos.gen))?;
-            reader.seek(SeekFrom::Start(cmd_pos.pos))?;
-
-            let mut entry_reader = reader.take(cmd_pos.len);
-            let len = io::copy(&mut entry_reader, &mut compaction_writer)?;
-            *cmd_pos = CommandPos {
-                gen: compaction_gen,
-                pos: new_pos,
-                len,
-            };
-            new_pos += len;
-        }
-        compaction_writer.flush()?;
-
-        let stale_gens: Vec<u64> = self
-            .readers
-            .keys()
-            .filter(|&&gen| gen < compaction_gen)
-            .copied()
-            .collect();
-        for stale_gen in stale_gens {
-            self.readers.remove(&stale_gen);
-            fs::remove_file(log_path(&self.path, stale_gen))?;
-        }
-        self.uncompacted = 0;
-
-        Ok(())
     }
 }
 
+/// Compacts the log by writing only the latest values to a new log file.
+///
+/// After compaction, updates `safe_point` so reader threads can clean up
+/// stale file handles.
+fn compact(
+    writer: &mut KvStoreWriter,
+    index: &RwLock<HashMap<String, CommandPos>>,
+    safe_point: &AtomicU64,
+    path: &Path,
+) -> Result<()> {
+    let compaction_gen = writer.current_gen + 1;
+    writer.current_gen += 2;
+    writer.writer = new_log_file(path, writer.current_gen, &mut writer.readers)?;
+
+    let mut compaction_writer =
+        new_log_file(path, compaction_gen, &mut writer.readers)?;
+
+    let mut index = index.write().unwrap();
+    let mut new_pos = 0u64;
+    for cmd_pos in index.values_mut() {
+        let reader = writer
+            .readers
+            .get_mut(&cmd_pos.gen)
+            .ok_or(KvError::LogFileNotFound(cmd_pos.gen))?;
+        reader.seek(SeekFrom::Start(cmd_pos.pos))?;
+
+        let mut entry_reader = reader.take(cmd_pos.len);
+        let len = io::copy(&mut entry_reader, &mut compaction_writer)?;
+        *cmd_pos = CommandPos {
+            gen: compaction_gen,
+            pos: new_pos,
+            len,
+        };
+        new_pos += len;
+    }
+    compaction_writer.flush()?;
+    drop(index);
+
+    let stale_gens: Vec<u64> = writer
+        .readers
+        .keys()
+        .filter(|&&gen| gen < compaction_gen)
+        .copied()
+        .collect();
+    for stale_gen in stale_gens {
+        writer.readers.remove(&stale_gen);
+        fs::remove_file(log_path(path, stale_gen))?;
+    }
+    writer.uncompacted = 0;
+
+    // Update safe_point so reader threads know to discard old handles.
+    safe_point.store(compaction_gen, Ordering::Release);
+
+    Ok(())
+}
+
 impl KvsEngine for KvStore {
-    fn set(&mut self, key: String, value: String) -> Result<()> {
+    fn set(&self, key: String, value: String) -> Result<()> {
+        let mut writer = self.writer.lock().unwrap();
         let cmd = Command::Set {
             key: key.clone(),
             value,
         };
-        let pos = self.writer.pos;
-        serde_json::to_writer(&mut self.writer, &cmd)?;
-        self.writer.flush()?;
-        let new_pos = self.writer.pos;
+        let pos = writer.writer.pos;
+        serde_json::to_writer(&mut writer.writer, &cmd)?;
+        writer.writer.flush()?;
+        let new_pos = writer.writer.pos;
+        let current_gen = writer.current_gen;
 
-        if let Some(old_cmd) = self.index.insert(
+        // Write-lock the index to insert the new entry.
+        let mut index = self.index.write().unwrap();
+        if let Some(old_cmd) = index.insert(
             key,
             CommandPos {
-                gen: self.current_gen,
+                gen: current_gen,
                 pos,
                 len: new_pos - pos,
             },
         ) {
-            self.uncompacted += old_cmd.len;
+            writer.uncompacted += old_cmd.len;
         }
+        drop(index);
 
-        if self.uncompacted > COMPACTION_THRESHOLD {
-            self.compact()?;
+        if writer.uncompacted > COMPACTION_THRESHOLD {
+            compact(
+                &mut writer,
+                &self.index,
+                &self.reader.safe_point,
+                &self.path,
+            )?;
         }
 
         Ok(())
     }
 
+    /// Lock-free read: only acquires a RwLock read lock on the index,
+    /// then uses per-thread file handles. No Mutex contention.
     #[allow(clippy::needless_pass_by_value)]
-    fn get(&mut self, key: String) -> Result<Option<String>> {
-        if let Some(cmd_pos) = self.index.get(&key) {
-            let reader = self
-                .readers
-                .get_mut(&cmd_pos.gen)
-                .ok_or(KvError::LogFileNotFound(cmd_pos.gen))?;
-            reader.seek(SeekFrom::Start(cmd_pos.pos))?;
-            let cmd_reader = reader.take(cmd_pos.len);
-            if let Command::Set { value, .. } = serde_json::from_reader(cmd_reader)? {
-                Ok(Some(value))
-            } else {
-                Err(KvError::UnexpectedCommandType)
-            }
+    fn get(&self, key: String) -> Result<Option<String>> {
+        // Read-lock the index — multiple threads can do this concurrently.
+        let index = self.index.read().unwrap();
+        if let Some(cmd_pos) = index.get(&key).copied() {
+            drop(index); // Release read lock as early as possible.
+
+            // Use per-thread reader (lazy open, no shared state).
+            self.reader.read_command(cmd_pos)
         } else {
             Ok(None)
         }
     }
 
     #[allow(clippy::needless_pass_by_value)]
-    fn remove(&mut self, key: String) -> Result<()> {
-        if !self.index.contains_key(&key) {
-            return Err(KvError::KeyNotFound);
+    fn remove(&self, key: String) -> Result<()> {
+        // Acquire writer mutex first to serialize all writes, then check
+        // existence. This prevents a TOCTOU race where another thread
+        // removes the same key between our check and our write.
+        let mut writer = self.writer.lock().unwrap();
+
+        {
+            let index = self.index.read().unwrap();
+            if !index.contains_key(&key) {
+                return Err(KvError::KeyNotFound);
+            }
         }
 
         let cmd = Command::Remove { key: key.clone() };
-        serde_json::to_writer(&mut self.writer, &cmd)?;
-        self.writer.flush()?;
+        serde_json::to_writer(&mut writer.writer, &cmd)?;
+        writer.writer.flush()?;
 
-        if let Some(old_cmd) = self.index.remove(&key) {
-            self.uncompacted += old_cmd.len;
+        let mut index = self.index.write().unwrap();
+        if let Some(old_cmd) = index.remove(&key) {
+            writer.uncompacted += old_cmd.len;
         }
 
         Ok(())
@@ -254,7 +377,9 @@ fn new_log_file(
     readers: &mut HashMap<u64, BufReaderWithPos<File>>,
 ) -> Result<BufWriterWithPos<File>> {
     let path = log_path(path, gen);
-    let writer = BufWriterWithPos::new(OpenOptions::new().create(true).append(true).open(&path)?)?;
+    let writer = BufWriterWithPos::new(
+        OpenOptions::new().create(true).append(true).open(&path)?,
+    )?;
     readers.insert(gen, BufReaderWithPos::new(File::open(&path)?)?);
     Ok(writer)
 }

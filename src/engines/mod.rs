@@ -4,21 +4,24 @@ use crate::Result;
 ///
 /// Implementors provide persistent key-value storage with
 /// set, get, and remove operations.
-pub trait KvsEngine {
+///
+/// Engines must be cloneable (cheaply, via `Arc`) and safe to
+/// send across threads, enabling concurrent access from a thread pool.
+pub trait KvsEngine: Clone + Send + 'static {
     /// Sets the value of a string key to a string.
     ///
     /// If the key already exists, the previous value will be overwritten.
-    fn set(&mut self, key: String, value: String) -> Result<()>;
+    fn set(&self, key: String, value: String) -> Result<()>;
 
     /// Gets the string value of a given string key.
     ///
     /// Returns `None` if the key does not exist.
-    fn get(&mut self, key: String) -> Result<Option<String>>;
+    fn get(&self, key: String) -> Result<Option<String>>;
 
     /// Removes a given key.
     ///
     /// Returns an error if the key does not exist.
-    fn remove(&mut self, key: String) -> Result<()>;
+    fn remove(&self, key: String) -> Result<()>;
 }
 
 mod kvs;

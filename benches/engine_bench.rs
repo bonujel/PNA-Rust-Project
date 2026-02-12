@@ -13,7 +13,7 @@ fn write_bench(c: &mut Criterion) {
                 let store = KvStore::open(temp_dir.path()).unwrap();
                 (temp_dir, store)
             },
-            |(_dir, mut store)| {
+            |(_dir, store)| {
                 for i in 0..100 {
                     store
                         .set(format!("key{}", i), "value".to_string())
@@ -32,7 +32,7 @@ fn write_bench(c: &mut Criterion) {
                 let store = SledKvsEngine::new(db);
                 (temp_dir, store)
             },
-            |(_dir, mut store)| {
+            |(_dir, store)| {
                 for i in 0..100 {
                     store
                         .set(format!("key{}", i), "value".to_string())
@@ -53,7 +53,7 @@ fn read_bench(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let temp_dir = TempDir::new().unwrap();
-                let mut store = KvStore::open(temp_dir.path()).unwrap();
+                let store = KvStore::open(temp_dir.path()).unwrap();
                 for i in 0..100 {
                     store
                         .set(format!("key{}", i), "value".to_string())
@@ -61,7 +61,7 @@ fn read_bench(c: &mut Criterion) {
                 }
                 (temp_dir, store)
             },
-            |(_dir, mut store)| {
+            |(_dir, store)| {
                 let mut rng = thread_rng();
                 for _ in 0..100 {
                     let key = format!("key{}", rng.gen_range(0..100));
@@ -77,7 +77,7 @@ fn read_bench(c: &mut Criterion) {
             || {
                 let temp_dir = TempDir::new().unwrap();
                 let db = sled::open(temp_dir.path()).unwrap();
-                let mut store = SledKvsEngine::new(db);
+                let store = SledKvsEngine::new(db);
                 for i in 0..100 {
                     store
                         .set(format!("key{}", i), "value".to_string())
@@ -85,7 +85,7 @@ fn read_bench(c: &mut Criterion) {
                 }
                 (temp_dir, store)
             },
-            |(_dir, mut store)| {
+            |(_dir, store)| {
                 let mut rng = thread_rng();
                 for _ in 0..100 {
                     let key = format!("key{}", rng.gen_range(0..100));

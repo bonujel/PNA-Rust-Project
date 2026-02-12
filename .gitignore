@@ -2,3 +2,20 @@
 docs/
 .claude/
 .serena/
+
+# Runtime artifacts
+engine
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.*
